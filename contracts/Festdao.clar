@@ -14,11 +14,23 @@
 (define-constant ERR_ALREADY_RESERVED (err u408))
 (define-constant ERR_NOT_BORROWED (err u409))
 (define-constant ERR_INVALID_RATING (err u410))
+(define-constant ERR_SKILL_NOT_FOUND (err u411))
+(define-constant ERR_TASK_NOT_FOUND (err u412))
+(define-constant ERR_ALREADY_APPLIED (err u413))
+(define-constant ERR_TASK_NOT_OPEN (err u414))
+(define-constant ERR_INVALID_COMPLETION_STATUS (err u415))
+(define-constant ERR_NOT_TASK_CREATOR (err u416))
+(define-constant ERR_NOT_ASSIGNED_PROVIDER (err u417))
+(define-constant ERR_TASK_ALREADY_COMPLETED (err u418))
+(define-constant ERR_INSUFFICIENT_SKILL_REPUTATION (err u419))
 
 (define-data-var next-event-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-resource-id uint u1)
 (define-data-var next-reservation-id uint u1)
+(define-data-var next-skill-id uint u1)
+(define-data-var next-task-id uint u1)
+(define-data-var next-application-id uint u1)
 (define-data-var treasury-balance uint u0)
 (define-data-var min-voting-period uint u144)
 
@@ -110,6 +122,71 @@
 (define-map resource-ratings
   {resource-id: uint, rater: principal}
   {rating: uint, comment: (string-ascii 200), created-at: uint}
+)
+
+(define-map skills
+  uint
+  {
+    provider: principal,
+    category: (string-ascii 50),
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    hourly-rate: uint,
+    skill-level: uint,
+    total-rating: uint,
+    rating-count: uint,
+    completed-tasks: uint,
+    available: bool,
+    portfolio-link: (string-ascii 200),
+    created-at: uint
+  }
+)
+
+(define-map tasks
+  uint
+  {
+    creator: principal,
+    event-id: (optional uint),
+    category: (string-ascii 50),
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    budget: uint,
+    duration-hours: uint,
+    skill-level-required: uint,
+    deadline: uint,
+    status: (string-ascii 20),
+    assigned-provider: (optional principal),
+    completion-rating: uint,
+    created-at: uint
+  }
+)
+
+(define-map task-applications
+  uint
+  {
+    task-id: uint,
+    applicant: principal,
+    proposed-rate: uint,
+    message: (string-ascii 300),
+    skill-id: uint,
+    status: (string-ascii 20),
+    applied-at: uint
+  }
+)
+
+(define-map skill-ratings
+  {skill-id: uint, rater: principal}
+  {rating: uint, comment: (string-ascii 200), task-id: uint, created-at: uint}
+)
+
+(define-map member-skill-reputation
+  {member: principal, category: (string-ascii 50)}
+  {reputation-score: uint, tasks-completed: uint, avg-rating: uint}
+)
+
+(define-map task-applicant-check
+  {task-id: uint, applicant: principal}
+  bool
 )
 
 (define-public (become-member)
@@ -521,3 +598,272 @@
 (define-read-only (get-next-reservation-id)
   (var-get next-reservation-id)
 )
+
+(define-public (create-skill (category (string-ascii 50)) (title (string-ascii 100)) (description (string-ascii 300)) (hourly-rate uint) (skill-level uint) (portfolio-link (string-ascii 200)))
+  (let ((skill-id (var-get next-skill-id)))
+    (asserts! (is-member tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> hourly-rate u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= skill-level u5) ERR_INVALID_RATING)
+    (asserts! (> skill-level u0) ERR_INVALID_RATING)
+    
+    (map-set skills skill-id {
+      provider: tx-sender,
+      category: category,
+      title: title,
+      description: description,
+      hourly-rate: hourly-rate,
+      skill-level: skill-level,
+      total-rating: u0,
+      rating-count: u0,
+      completed-tasks: u0,
+      available: true,
+      portfolio-link: portfolio-link,
+      created-at: stacks-block-height
+    })
+    
+    (var-set next-skill-id (+ skill-id u1))
+    (ok skill-id)
+  )
+)
+
+(define-public (update-skill-availability (skill-id uint) (available bool))
+  (let ((skill-data (unwrap! (map-get? skills skill-id) ERR_SKILL_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get provider skill-data)) ERR_UNAUTHORIZED)
+    
+    (map-set skills skill-id (merge skill-data {available: available}))
+    (ok true)
+  )
+)
+
+(define-public (create-task (event-id (optional uint)) (category (string-ascii 50)) (title (string-ascii 100)) (description (string-ascii 500)) (budget uint) (duration-hours uint) (skill-level-required uint) (deadline uint))
+  (let ((task-id (var-get next-task-id)))
+    (asserts! (is-member tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> budget u0) ERR_INVALID_AMOUNT)
+    (asserts! (> duration-hours u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= skill-level-required u5) ERR_INVALID_RATING)
+    (asserts! (> skill-level-required u0) ERR_INVALID_RATING)
+    (asserts! (> deadline stacks-block-height) ERR_INVALID_AMOUNT)
+    
+    (match event-id
+      some-event-id (asserts! (is-some (map-get? events some-event-id)) ERR_NOT_FOUND)
+      true
+    )
+    
+    (map-set tasks task-id {
+      creator: tx-sender,
+      event-id: event-id,
+      category: category,
+      title: title,
+      description: description,
+      budget: budget,
+      duration-hours: duration-hours,
+      skill-level-required: skill-level-required,
+      deadline: deadline,
+      status: "open",
+      assigned-provider: none,
+      completion-rating: u0,
+      created-at: stacks-block-height
+    })
+    
+    (var-set next-task-id (+ task-id u1))
+    (ok task-id)
+  )
+)
+
+(define-public (apply-for-task (task-id uint) (skill-id uint) (proposed-rate uint) (message (string-ascii 300)))
+  (let (
+    (task-data (unwrap! (map-get? tasks task-id) ERR_TASK_NOT_FOUND))
+    (skill-data (unwrap! (map-get? skills skill-id) ERR_SKILL_NOT_FOUND))
+    (application-id (var-get next-application-id))
+  )
+    (asserts! (is-member tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status task-data) "open") ERR_TASK_NOT_OPEN)
+    (asserts! (is-eq tx-sender (get provider skill-data)) ERR_UNAUTHORIZED)
+    (asserts! (get available skill-data) ERR_RESOURCE_NOT_AVAILABLE)
+    (asserts! (>= (get skill-level skill-data) (get skill-level-required task-data)) ERR_INSUFFICIENT_SKILL_REPUTATION)
+    (asserts! (is-eq (get category skill-data) (get category task-data)) ERR_INVALID_AMOUNT)
+    (asserts! (> proposed-rate u0) ERR_INVALID_AMOUNT)
+    
+    (asserts! (is-none (map-get? task-applicant-check {task-id: task-id, applicant: tx-sender})) ERR_ALREADY_APPLIED)
+    
+    (map-set task-applicant-check {task-id: task-id, applicant: tx-sender} true)
+    
+    (map-set task-applications application-id {
+      task-id: task-id,
+      applicant: tx-sender,
+      proposed-rate: proposed-rate,
+      message: message,
+      skill-id: skill-id,
+      status: "pending",
+      applied-at: stacks-block-height
+    })
+    
+    (var-set next-application-id (+ application-id u1))
+    (ok application-id)
+  )
+)
+
+(define-public (assign-task (task-id uint) (application-id uint))
+  (let (
+    (task-data (unwrap! (map-get? tasks task-id) ERR_TASK_NOT_FOUND))
+    (application (unwrap! (map-get? task-applications application-id) ERR_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator task-data)) ERR_NOT_TASK_CREATOR)
+    (asserts! (is-eq (get status task-data) "open") ERR_TASK_NOT_OPEN)
+    (asserts! (is-eq (get task-id application) task-id) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq (get status application) "pending") ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? (get budget task-data) tx-sender (as-contract tx-sender)))
+    
+    (map-set tasks task-id (merge task-data {
+      status: "assigned",
+      assigned-provider: (some (get applicant application))
+    }))
+    
+    (map-set task-applications application-id (merge application {status: "accepted"}))
+    
+    (ok true)
+  )
+)
+
+(define-public (complete-task (task-id uint))
+  (let ((task-data (unwrap! (map-get? tasks task-id) ERR_TASK_NOT_FOUND)))
+    (asserts! (is-eq (some tx-sender) (get assigned-provider task-data)) ERR_NOT_ASSIGNED_PROVIDER)
+    (asserts! (is-eq (get status task-data) "assigned") ERR_TASK_NOT_OPEN)
+    
+    (map-set tasks task-id (merge task-data {status: "pending-review"}))
+    (ok true)
+  )
+)
+
+(define-public (approve-task-completion (task-id uint) (rating uint))
+  (let ((task-data (unwrap! (map-get? tasks task-id) ERR_TASK_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get creator task-data)) ERR_NOT_TASK_CREATOR)
+    (asserts! (is-eq (get status task-data) "pending-review") ERR_INVALID_COMPLETION_STATUS)
+    (asserts! (<= rating u5) ERR_INVALID_RATING)
+    (asserts! (> rating u0) ERR_INVALID_RATING)
+    
+    (let ((provider (unwrap! (get assigned-provider task-data) ERR_NOT_ASSIGNED_PROVIDER)))
+      (try! (as-contract (stx-transfer? (get budget task-data) tx-sender provider)))
+      
+      (map-set tasks task-id (merge task-data {
+        status: "completed",
+        completion-rating: rating
+      }))
+      
+      (let ((provider-reputation (default-to u1 (map-get? member-reputation provider))))
+        (map-set member-reputation provider (+ provider-reputation u1))
+      )
+      
+      (let ((category-rep (default-to {reputation-score: u0, tasks-completed: u0, avg-rating: u0} 
+                                    (map-get? member-skill-reputation {member: provider, category: (get category task-data)}))))
+        (let (
+          (new-tasks-completed (+ (get tasks-completed category-rep) u1))
+          (new-total-rating (+ (* (get avg-rating category-rep) (get tasks-completed category-rep)) rating))
+          (new-avg-rating (/ new-total-rating new-tasks-completed))
+        )
+          (map-set member-skill-reputation {member: provider, category: (get category task-data)} {
+            reputation-score: (+ (get reputation-score category-rep) rating),
+            tasks-completed: new-tasks-completed,
+            avg-rating: new-avg-rating
+          })
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (rate-skill-performance (skill-id uint) (task-id uint) (rating uint) (comment (string-ascii 200)))
+  (let (
+    (skill-data (unwrap! (map-get? skills skill-id) ERR_SKILL_NOT_FOUND))
+    (task-data (unwrap! (map-get? tasks task-id) ERR_TASK_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator task-data)) ERR_NOT_TASK_CREATOR)
+    (asserts! (is-eq (get status task-data) "completed") ERR_TASK_NOT_OPEN)
+    (asserts! (is-eq (some (get provider skill-data)) (get assigned-provider task-data)) ERR_UNAUTHORIZED)
+    (asserts! (<= rating u5) ERR_INVALID_RATING)
+    (asserts! (> rating u0) ERR_INVALID_RATING)
+    (asserts! (is-none (map-get? skill-ratings {skill-id: skill-id, rater: tx-sender})) ERR_ALREADY_VOTED)
+    
+    (map-set skill-ratings {skill-id: skill-id, rater: tx-sender} {
+      rating: rating,
+      comment: comment,
+      task-id: task-id,
+      created-at: stacks-block-height
+    })
+    
+    (let (
+      (new-total-rating (+ (get total-rating skill-data) rating))
+      (new-rating-count (+ (get rating-count skill-data) u1))
+      (new-completed-tasks (+ (get completed-tasks skill-data) u1))
+    )
+      (map-set skills skill-id (merge skill-data {
+        total-rating: new-total-rating,
+        rating-count: new-rating-count,
+        completed-tasks: new-completed-tasks
+      }))
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-task (task-id uint))
+  (let ((task-data (unwrap! (map-get? tasks task-id) ERR_TASK_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get creator task-data)) ERR_NOT_TASK_CREATOR)
+    (asserts! (not (is-eq (get status task-data) "completed")) ERR_TASK_ALREADY_COMPLETED)
+    
+    (if (is-eq (get status task-data) "assigned")
+      (try! (as-contract (stx-transfer? (get budget task-data) tx-sender (get creator task-data))))
+      true
+    )
+    
+    (map-set tasks task-id (merge task-data {status: "cancelled"}))
+    (ok true)
+  )
+)
+
+(define-read-only (get-skill (skill-id uint))
+  (map-get? skills skill-id)
+)
+
+(define-read-only (get-task (task-id uint))
+  (map-get? tasks task-id)
+)
+
+(define-read-only (get-task-application (application-id uint))
+  (map-get? task-applications application-id)
+)
+
+(define-read-only (get-skill-rating (skill-id uint) (rater principal))
+  (map-get? skill-ratings {skill-id: skill-id, rater: rater})
+)
+
+(define-read-only (get-skill-average-rating (skill-id uint))
+  (let ((skill-data (unwrap! (map-get? skills skill-id) ERR_SKILL_NOT_FOUND)))
+    (if (> (get rating-count skill-data) u0)
+      (ok (/ (get total-rating skill-data) (get rating-count skill-data)))
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (get-member-skill-reputation (member principal) (category (string-ascii 50)))
+  (map-get? member-skill-reputation {member: member, category: category})
+)
+
+(define-read-only (get-next-skill-id)
+  (var-get next-skill-id)
+)
+
+(define-read-only (get-next-task-id)
+  (var-get next-task-id)
+)
+
+(define-read-only (get-next-application-id)
+  (var-get next-application-id)
+)
+
+
