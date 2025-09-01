@@ -866,4 +866,119 @@
   (var-get next-application-id)
 )
 
+;; Event Attendance Verification System
+;; Additional data maps for attendance tracking
+(define-map event-attendance
+  {event-id: uint, participant: principal}
+  {
+    verified: bool,
+    verification-time: uint,
+    verifier: principal,
+    attendance-score: uint
+  }
+)
 
+(define-map member-attendance-history
+  principal
+  {
+    events-joined: uint,
+    events-attended: uint,
+    attendance-rate: uint,
+    reputation-earned: uint
+  }
+)
+
+;; Verify attendance for a participant at an event
+(define-public (verify-event-attendance
+  (event-id uint)
+  (participant principal)
+  (attendance-score uint)
+  (notes (string-ascii 200)))
+  (let (
+    (event-data (unwrap! (map-get? events event-id) ERR_NOT_FOUND))
+    (participant-data (map-get? event-participants {event-id: event-id, participant: participant}))
+    (existing-attendance (map-get? event-attendance {event-id: event-id, participant: participant}))
+  )
+    ;; Check authorization - event creator or contract owner can verify
+    (asserts! (or (is-eq tx-sender (get creator event-data)) (is-eq tx-sender CONTRACT_OWNER)) ERR_UNAUTHORIZED)
+    ;; Check participant joined the event
+    (asserts! (is-some participant-data) ERR_NOT_FOUND)
+    ;; Check event is completed
+    (asserts! (is-eq (get status event-data) "completed") ERR_EVENT_NOT_ACTIVE)
+    ;; Check attendance score is valid (1-5)
+    (asserts! (<= attendance-score u5) ERR_INVALID_RATING)
+    (asserts! (> attendance-score u0) ERR_INVALID_RATING)
+    ;; Check not already verified
+    (asserts! (is-none existing-attendance) ERR_ALREADY_EXISTS)
+    
+    ;; Record attendance verification
+    (map-set event-attendance {event-id: event-id, participant: participant} {
+      verified: true,
+      verification-time: stacks-block-height,
+      verifier: tx-sender,
+      attendance-score: attendance-score
+    })
+    
+    ;; Update member attendance history
+    (let ((current-stats (default-to
+                           {events-joined: u0, events-attended: u0, attendance-rate: u0, reputation-earned: u0}
+                           (map-get? member-attendance-history participant))))
+      (let (
+        (new-attended (+ (get events-attended current-stats) u1))
+        (total-events (get events-joined current-stats))
+        (new-rate (if (> total-events u0) (/ (* new-attended u100) total-events) u100))
+        (bonus-reputation (if (<= attendance-score u3) u1 (if (<= attendance-score u4) u2 u3)))
+      )
+        (map-set member-attendance-history participant {
+          events-joined: total-events,
+          events-attended: new-attended,
+          attendance-rate: new-rate,
+          reputation-earned: (+ (get reputation-earned current-stats) bonus-reputation)
+        })
+        
+        ;; Award reputation bonus to participant
+        (let ((current-rep (default-to u1 (map-get? member-reputation participant))))
+          (map-set member-reputation participant (+ current-rep bonus-reputation))
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Enhanced join-event to track attendance stats
+(define-public (join-event-with-tracking (event-id uint))
+  (let (
+    (result (try! (join-event event-id)))
+    (current-stats (default-to
+                     {events-joined: u0, events-attended: u0, attendance-rate: u0, reputation-earned: u0}
+                     (map-get? member-attendance-history tx-sender)))
+  )
+    (map-set member-attendance-history tx-sender
+      (merge current-stats {
+        events-joined: (+ (get events-joined current-stats) u1)
+      }))
+    (ok true)
+  )
+)
+
+;; Read-only functions for attendance verification
+(define-read-only (get-attendance-record (event-id uint) (participant principal))
+  (map-get? event-attendance {event-id: event-id, participant: participant})
+)
+
+(define-read-only (get-member-attendance-stats (member principal))
+  (map-get? member-attendance-history member)
+)
+
+(define-read-only (did-attend-event (event-id uint) (participant principal))
+  (is-some (map-get? event-attendance {event-id: event-id, participant: participant}))
+)
+
+(define-read-only (get-member-attendance-rate (member principal))
+  (match (map-get? member-attendance-history member)
+    stats (get attendance-rate stats)
+    u0
+  )
+)
